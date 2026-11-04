@@ -1,0 +1,257 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{titling}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{parskip}
+\usepackage{fancyhdr}
+
+\definecolor{codebg}{RGB}{245,245,245}
+\definecolor{codeframe}{RGB}{200,200,200}
+
+\lstset{
+    backgroundcolor=\color{codebg},
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    rulecolor=\color{codeframe},
+    framesep=6pt,
+    xleftmargin=6pt,
+    xrightmargin=6pt
+}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{Game Review Platform --- HLD / LLD}
+\fancyfoot[C]{\thepage}
+
+\title{\Large\textbf{Game Review Platform} \\ \large High-Level \& Low-Level Design}
+\author{Yash}
+\date{October 2026}
+
+\begin{document}
+\maketitle
+\thispagestyle{fancy}
+
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Requirements}
+
+\subsection{Functional}
+\begin{itemize}[nosep]
+    \item Browse and search games
+    \item Add ratings and reviews
+    \item Basic user profiles
+    \item Get recommendations (hybrid: content-based + lightweight collaborative filtering)
+    \item Admin panel (separate service) for game catalog CRUD, with moderation to follow later
+\end{itemize}
+
+\textit{Follow-other-users is dropped from scope for the baseline build (fewer moving parts). Recommendations do not depend on a follow graph --- they are built from the \texttt{reviews} collection instead.}
+
+\subsection{Non-Functional}
+Pretend-scale, chosen deliberately so the architecture requires sharding, replication, caching, async messaging, and load balancing rather than just resembling them.
+
+\begin{itemize}[nosep]
+    \item 500M registered users, $\sim$50M daily active
+    \item Peak $\sim$50{,}000 read QPS / $\sim$5{,}000 write QPS (90:10 split)
+    \item 10M games in catalog, multi-TB of review/rating data
+    \item Multi-region user base (US, EU, APAC)
+    \item Eventual consistency acceptable
+    \item 99.99\% availability target
+    \item $<$300ms latency per call
+\end{itemize}
+
+% ============================================================
+\section{Capacity Estimation}
+
+\begin{itemize}[nosep]
+    \item Target scale: 500M registered users, $\sim$50M DAU, 10M games
+    \item Peak load target: $\sim$50{,}000 read QPS / $\sim$5{,}000 write QPS (90:10 split)
+    \item Storage: user profiles $\sim$500GB ($500\text{M} \times \sim 1\text{KB}$), game catalog $\sim$50GB ($10\text{M} \times \sim 5\text{KB}$), reviews/ratings growing into multi-TB as volume accumulates
+    \item \textbf{Conclusion:} this load and data volume rules out a single-node database, which is what justifies sharding and replication rather than them being default choices
+\end{itemize}
+
+% ============================================================
+\section{Tech Stack}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}p{2.2cm}p{4.3cm}p{7cm}@{}}
+\toprule
+\textbf{Layer} & \textbf{Choice} & \textbf{Reasoning} \\
+\midrule
+Frontend & Next.js & SSR for SEO, good fit for a content-browsing site \\
+Backend & Node.js + Express & Lightweight API layer; workload is I/O-bound (90\% reads), fits Node's event-loop model \\
+Database & Self-managed MongoDB (sharded cluster, replica sets) & Document model fits flexible game metadata; self-managed (vs.\ GCP-managed Firestore/Atlas) so sharding and replication are configured and observed directly \\
+Cache & Redis & Cache-aside pattern for hot reads \\
+Messaging & Message queue (Kafka or RabbitMQ) & Overload buffering and async propagation of write side-effects \\
+Search & MongoDB \texttt{\$text} index for now; Elasticsearch deferred & Self-managed Mongo has no Atlas Search (Lucene); \texttt{\$text} is enough until load numbers force a dedicated search service \\
+Deployment & GCP (GCE/GKE) & Target cloud platform \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textit{Rejected: Firestore (GCP-managed NoSQL) --- auto-shards and auto-replicates invisibly, which would hide the exact mechanics this project is meant to teach.}
+
+% ============================================================
+\section{High-Level Design}
+
+\subsection{Architecture Overview}
+
+Client $\rightarrow$ Load Balancer (hand-rolled round-robin / least-connections, not a managed LB --- the point is to learn the mechanism) $\rightarrow$ App Servers (stateless, horizontally scaled Node/Express) $\rightarrow$ fans out to:
+
+\begin{itemize}[nosep]
+    \item Redis Cache (TTL 10 min + invalidate on write)
+    \item Message Queue (backpressure + async events) $\rightarrow$ Background Workers $\rightarrow$ back to Redis Cache / \texttt{recommendations} collection
+    \item MongoDB Router / \texttt{mongos} (routes query by shard key) $\rightarrow$ Shard 1 (Primary + Replicas), Shard 2 (Primary + Replicas), \ldots
+\end{itemize}
+
+\subsection{Read Path: Search for a Game}
+
+\begin{enumerate}[nosep]
+    \item Client sends a GET request to the load balancer; rate limit check passes
+    \item Load balancer routes to an available (stateless) app server
+    \item App server computes the cache key (\texttt{game:<gameId>}) and checks Redis
+    \item \textbf{Cache hit} --- return the cached JSON directly (fast path)
+    \item \textbf{Cache miss} --- app server computes the shard key (\texttt{hash(gameId) \% numShards}), queries that shard through the \texttt{mongos} router; the query is served by a replica, not the primary
+    \item App server writes the fetched result back into Redis with a TTL
+    \item Response returned to client
+\end{enumerate}
+
+\subsection{Write Path: Submit a Review}
+
+\begin{enumerate}[nosep]
+    \item Client sends a POST request to the load balancer $\rightarrow$ routed to an app server
+    \item App server computes the shard key (\texttt{hash(gameId) \% numShards}) and writes synchronously to that shard's \textbf{primary} --- needs to be durable before confirming
+    \item Primary confirms the durable write $\rightarrow$ app server returns \texttt{201 Created} to the client
+    \item App server publishes a \texttt{review\_added} event to the message queue
+    \item Two consumer groups process it independently (see \S\ref{sec:worker-queue})
+    \item Independently, MongoDB's own replica-set protocol propagates the write from primary to replicas in the background --- this replication lag is the actual eventual-consistency window
+\end{enumerate}
+
+\subsection{Sharding Strategy}
+
+\begin{itemize}[nosep]
+    \item Shard key: \texttt{hash(userId) \% numShards} for \texttt{users}, \texttt{hash(gameId) \% numShards} for \texttt{games} and \texttt{reviews} (MongoDB hashed sharding)
+    \item Rejected: alphabet-of-username and raw sequential IDs --- both create hotspots (uneven username distribution; sequential IDs funnel new writes onto the newest shard)
+    \item A good shard key needs: high cardinality, even distribution of data and write load, no monotonically increasing raw value used directly
+    \item Bonus: since most queries already include \texttt{gameId} or \texttt{userId}, a hashed key still lets most queries target a single shard
+\end{itemize}
+
+\subsection{Caching Strategy}
+
+\begin{itemize}[nosep]
+    \item Pattern: cache-aside (lazy loading)
+    \item Cache key: \texttt{game:<gameId>}
+    \item TTL: 10 minutes, as a safety net
+    \item Invalidation: explicit invalidate-on-write, triggered by a background worker
+    \item TTL + invalidation together: invalidation handles the common path fast, TTL self-heals a missed event
+\end{itemize}
+
+\subsection{Async Messaging / Queue Strategy}
+
+The queue serves two distinct purposes:
+\begin{enumerate}[nosep]
+    \item \textbf{Backpressure / overload buffering} --- absorbing request spikes so the app tier degrades gracefully
+    \item \textbf{Eventual-consistency propagation} --- carrying side effects after a write is durably confirmed on the primary
+\end{enumerate}
+
+\textit{Durability requirement: messages must persist and require consumer acknowledgment (at-least-once delivery) --- a worker crashing mid-task must not silently drop the event.}
+
+% ============================================================
+\section{Low-Level Design}
+
+\subsection{Data Model}
+
+\begin{lstlisting}
+users: { user_id, username, email, password_hash, review_count }
+games: { game_id, name, genre: [], release_year, cover_image,
+          avg_rating, review_count }
+reviews: { review_id, user_id, game_id, rating (number), comment,
+           created_at }
+recommendations: { user_id (key), recommended_game_ids: [game_id],
+                    computed_at, review_count_at_last_update }
+\end{lstlisting}
+
+Key decisions:
+\begin{itemize}[nosep]
+    \item \texttt{rating} stored as a number (not string) on both \texttt{reviews} and as the aggregate on \texttt{games}, so averaging needs no type conversion
+    \item \texttt{games.avg\_rating} + \texttt{games.review\_count} stored together so the aggregate can be updated incrementally:
+    \[
+        \text{newAvg} = \frac{\text{oldAvg} \times \text{oldCount} + \text{newRating}}{\text{oldCount} + 1}
+    \]
+    instead of rescanning every review per update
+    \item No \texttt{reviews} array on \texttt{users} --- avoids a denormalization-sync problem; ``reviews by user X'' is just a query on \texttt{reviews} filtered by \texttt{user\_id}
+    \item \texttt{recommendations} stores only \texttt{game\_id}s, not duplicated game metadata --- a deliberate normalize-over-denormalize choice; the read path re-fetches metadata in one batched query (\texttt{games.find(\{game\_id: \{\$in: [...]\}\})})
+    \item Dates stored/serialized as ISO 8601 (\texttt{YYYY-MM-DD}) --- avoids regional day/month ambiguity
+\end{itemize}
+
+\subsection{Worker \& Queue Design}
+\label{sec:worker-queue}
+
+Two consumer groups on the same \texttt{review\_added} event topic, isolated so a slow path never blocks a fast one:
+
+\begin{itemize}[nosep]
+    \item \textbf{Worker A (fast path):} cache invalidation for the game's Redis entry + incremental aggregate rating recompute on \texttt{games}
+    \item \textbf{Worker B (recommendations path):} increments the user's review counter, checks against a threshold (e.g.\ 10 new reviews since last computation); if exceeded, enqueues a recompute job for that user
+    \item \textbf{Scheduled job (nightly cron):} full batch recomputation of recommendations for all users, independent of the threshold path --- a lambda-architecture pattern (batch layer + event-triggered speed layer)
+\end{itemize}
+
+\subsection{API Contracts}
+
+\begin{lstlisting}
+GET  /api/games/search?q=&genre=&page=&limit=   (no auth; $text index)
+     -> 200 OK  { results: [{ game_id, name, avg_rating,
+                  release_year, cover_image }], page, limit, total }
+
+GET  /api/games/:game_id                         (no auth)
+     -> 200 OK  { game_id, name, genre: [], release_year,
+                  avg_rating, review_count, cover_image }
+
+POST /api/reviews   (auth required; user_id from JWT, never body)
+     body: { game_id, rating, comment }
+     -> 201 Created  { review_id }
+
+GET  /api/recommendations   (auth required; user_id from JWT)
+     -> 200 OK  { results: [{ game_id, name, avg_rating,
+                  cover_image }] }
+     (handler: recommendations.findOne({user_id})
+               -> games.find({game_id: {$in: [...]}}) -> merge)
+\end{lstlisting}
+
+% ============================================================
+\section{Implementation Roadmap}
+
+\begin{enumerate}[nosep]
+    \item[0.] \textbf{Baseline CRUD app} (Next.js + Express + single MongoDB) --- no cache/queue/LB/replication/sharding yet
+    \item Caching (Redis, cache-aside)
+    \item Async queue (durable, ack-based consumer)
+    \item Load balancing (hand-rolled round-robin/least-connections across multiple local app instances)
+    \item Replication (MongoDB replica set --- primary election, failover)
+    \item Sharding (shard the replica sets, routing via \texttt{mongos})
+\end{enumerate}
+
+\textit{All of 0--5 run locally via Docker Compose on one machine; cloud (GCE/GKE) is a later stretch exercise for simulating true multi-region replication, not required for the core mechanics.}
+
+% ============================================================
+\section{Open Questions}
+
+\begin{itemize}[nosep]
+    \item[$\square$] Finalize message queue tech (Kafka vs.\ RabbitMQ) once consumer patterns are clearer
+    \item[$\square$] Decide replica count per shard and number of shards for the local Docker implementation slice
+    \item[$\square$] Admin panel API contracts (deferred until baseline CRUD ships)
+\end{itemize}
+
+\end{document}
