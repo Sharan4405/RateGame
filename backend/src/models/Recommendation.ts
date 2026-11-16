@@ -8,7 +8,7 @@ export interface IRecommendation {
 }
 
 const recommendationSchema = new Schema<IRecommendation>({
-  user_id: { type: Schema.Types.ObjectId, ref: "User", required: true, unique: true, index: true },
+  user_id: { type: Schema.Types.ObjectId, ref: "User", required: true, unique: true },
   recommended_game_ids: [{ type: Schema.Types.ObjectId, ref: "Game" }],
   computed_at: { type: Date, default: Date.now },
   review_count_at_last_update: { type: Number, default: 0 },

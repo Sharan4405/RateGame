@@ -12,7 +12,7 @@ export interface IGame {
 const gameSchema = new Schema<IGame>(
   {
     name: { type: String, required: true, trim: true },
-    genre: { type: [String], default: [] },
+    genre: { type: [String], default: [], required: true },
     release_year: { type: Date, required: true },
     cover_image: { type: String },
     avg_rating: { type: Number, default: 0, min: 0, max: 10 },
